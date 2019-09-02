@@ -1,0 +1,199 @@
+public class EmailTemplateResolver {
+
+    public static final Map <String, Schema.SObjectType> schemaMap = Schema.getGlobalDescribe();
+
+    public String selectedObject   {get; set;}
+    public String selectedField    {get; set;}
+    public String selectedTemplate {get; set;}
+    
+    public List<ObjectRecord> objectRecordList {get; set;}
+
+    public static Map<String, String> objectLabelToObjectNameMap;
+    public static Map<String, String> objectNameToObjectNameMap;
+    public List<SObject> recepientList;
+    public Map<String, Schema.SObjectField> fieldMap = new Map<String, Schema.SObjectField>();
+
+    public EmailTemplateResolver() {
+        objectRecordList = new List<ObjectRecord>();
+        selectedObject = 'account';
+    }
+
+    public List<SelectOption> getObjectNames() {
+
+        objectLabelToObjectNameMap = new Map<String, String>();
+        objectNameToObjectNameMap = new Map<String, String>();
+        List<SelectOption> objNames = new List<SelectOption>();
+        List<String> objectLabelsList = new List<String>();
+
+        for(String objectName : schemaMap.keySet()) {
+            if(       objectName != 'IdeaComment'
+                       && schemaMap.get(objectName).getDescribe().isQueryable() 
+                       && schemaMap.get(objectName).getDescribe().isSearchable()
+                       && schemaMap.get(objectName).getDescribe().isAccessible()
+                       && schemaMap.get(objectName).getDescribe().isCreateable()
+            ) {
+                objectLabelToObjectNameMap.put(schemaMap.get(objectName).getDescribe().getLabel() , schemaMap.get(objectName).getDescribe().getName());
+                
+                objectLabelsList.add(schemaMap.get(objectName).getDescribe().getLabel());
+                objectNameToObjectNameMap.put(schemaMap.get(objectName).getDescribe().getName() , schemaMap.get(objectName).getDescribe().getName());
+            }
+        }
+        objectLabelsList.sort();
+        objNames.add(new SelectOption('--None--','--None--'));
+        for(String objectOptions : objectLabelsList) {
+            if(objectLabelToObjectNameMap.containsKey(objectOptions)) {
+                String objectApiName = objectLabelToObjectNameMap.get(objectOptions);
+                objNames.add(new SelectOption(objectApiName, objectOptions));
+            }
+        }
+
+        return objNames; 
+    }
+
+     public List<SelectOption> getObjectFields() {
+            System.debug('\nGet fields called');
+            Map<String, Schema.SObjectType> globalDescribe = Schema.getGlobalDescribe(); 
+            Schema.SObjectType objectType = globalDescribe.get(selectedObject); 
+            Map<String, Schema.SobjectField> fieldMap1 = objectType.getDescribe().fields.getMap();
+            
+            
+            Schema.SObjectType ObjectSchema = schemaMap.get(selectedObject);
+            fieldMap = ObjectSchema.getDescribe().fields.getMap();
+            List<SelectOption> fieldNames = new List<SelectOption>();
+            for (String fieldName: fieldMap.keySet()) {
+                
+                Schema.SObjectField field = fieldMap1.get(fieldName);
+                Schema.DisplayType FldType = field.getDescribe().getType();
+                if (FldType == Schema.DisplayType.Email) {
+                    fieldNames.add(new SelectOption(fieldName,fieldMap.get(fieldName).getDescribe().getLabel()));
+                }
+            }
+            return fieldNames;
+     }
+      
+      public List<SelectOption> getEmailTemplates() {
+         List<SelectOption> templateNames = new List<SelectOption>();
+         EmailTemplate[] emailTemplateList = [
+             SELECT Name
+                  , Id 
+               FROM EmailTemplate 
+         ];
+         
+         for (EmailTemplate emailTemplate: emailTemplateList) {
+             templateNames.add(new SelectOption(emailTemplate.Id ,emailTemplate.Name));
+         }
+         return templateNames;
+      }
+      
+      public PageReference getRecords() {
+
+        if(objectRecordList.size() != 0) {
+            objectRecordList.clear();
+        }
+
+        List<SObject> sObjectList = new List<SObject>();
+        
+          String query =  'SELECT Id, ' + selectedField
+                        + ' FROM ' + selectedObject
+                        + ' ORDER BY CreatedDate DESC'
+                        + ' LIMIT 10';
+
+          sObjectList = (SObject[]) Database.query(query);
+          for(SObject objectRecord : sObjectList) {
+              sObject sObj = Schema.getGlobalDescribe().get(selectedObject).newSObject();
+              sObj = objectRecord;
+              objectRecordList.add(new ObjectRecord(sObj, false, selectedField));
+          }
+
+          return null;
+      }
+      
+      
+      public Pagereference sendEmail() {
+
+          recepientList = new List<SObject>();
+
+          for(ObjectRecord objRecord : objectRecordList) {
+              if(objRecord.isSelected) {
+                  recepientList.add(objRecord.objectRecord);
+              }
+          }
+
+          //sendEmailResultList = notifyApplicants(recepientList);
+          notifyApplicants(recepientList);
+          if(objectRecordList.size() != 0) {
+            objectRecordList.clear();
+          }
+          return null;
+      }
+      
+      public Messaging.SendEmailResult[] notifyApplicants(sObject[] pSobjectList) {
+
+            List<Messaging.SingleEmailMessage> mails = new List<Messaging.SingleEmailMessage>();
+            List<String> emailIdList = new List<String>();
+            Messaging.SendEmailResult[] sendEmailResult = new Messaging.SendEmailResult[] {};
+    
+            EmailTemplate notificationEmailTemplate = [
+                SELECT Id
+                     , Subject 
+                  FROM EmailTemplate
+                 WHERE Id = :selectedTemplate 
+            ];
+            
+            Map<Id,String> idWiseBodyMap = getMergedEmailBody(pSobjectList,selectedTemplate);
+            String body;
+            
+            for(sObject sObj : pSobjectList) {
+                
+                body = idWiseBodyMap.get(sObj.Id);
+                
+                if(String.isEmpty(body))
+                    continue;
+                
+                Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+                mail.setToAddresses(new String[] {(String)sObj.get(fieldMap.get(selectedField))});
+                mail.setSubject(notificationEmailTemplate.Subject);
+                mail.setHtmlBody(body);
+                mails.add(mail);
+            }
+    
+            if(mails.size() > 0) {
+                sendEmailResult = Messaging.sendEmail(mails);
+            }
+    
+            return sendEmailResult;
+      }
+      
+      //send mail to applicant with custom merge field replacement api
+    public Map<Id,String> getMergedEmailBody(List<sObject> pSobjectList,String emailTemplateName){
+        
+        Map<Id, Map<String,Id>>  objectNameRecordIdMap = new Map<Id, Map<String,Id>>();
+        String objectName = '';
+        //organization name
+        Organization organizationRecord = [
+             select Id
+                  , Name
+               from Organization
+              limit 1
+        ];
+
+        for(sObject sObj : pSobjectList) {
+        objectNameRecordIdMap.put(sObj.Id,new Map<String,Id>{   objectNameToObjectNameMap.get(selectedObject) => sObj.Id
+                                                                       , 'Organization' => organizationRecord.Id });
+        }
+        return EmailTemplate_PopulateMergeFields.populateEmailTemplateBody(objectNameRecordIdMap,emailTemplateName);
+        
+    }
+
+      public class ObjectRecord {
+        public SObject objectRecord { get; set; }
+        public Boolean isSelected   { get; set; }
+        public String  field        { get; set; }
+        public ObjectRecord(SObject objectRecord, Boolean isSelected, string field) {
+            this.objectRecord = objectRecord;
+            this.isSelected = isSelected;
+            this.field = field;
+        }
+      }
+
+}

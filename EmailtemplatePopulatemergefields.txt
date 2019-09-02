@@ -1,0 +1,217 @@
+public class EmailTemplate_PopulateMergeFields {
+    
+    public static final Integer QUERY_LIMIT_CROSS_BUFFER = 10;
+    public static final String mergeFieldPattern = '\\{!([^}]*)\\}';
+    
+    //templateName : Status Change Notification
+    //get the email template by its name which is provided by user
+    public static EmailTemplate getEmailTemplateByName(String templateName) {
+
+        EmailTemplate emailTemplate = [
+            SELECT Id
+                 , Name
+                 , Subject
+                 , HtmlValue
+              FROM EmailTemplate
+             WHERE Id = :templateName
+               AND IsActive = true
+        ];
+        return emailTemplate;
+    }
+    
+
+    //get all the merge fields in a set
+    public static Set<String> getMergeFields(EmailTemplate emailTemplate) {
+
+        Set<String> mergeFieldTokens = new Set<String>();
+
+        if(String.isEmpty(emailTemplate.HtmlValue)) {
+            return null;
+        }
+
+        Pattern mergePattern = Pattern.compile(mergeFieldPattern);
+        Matcher mergeMatcher = mergePattern.matcher(emailTemplate.HtmlValue);
+        while(mergeMatcher.find()) {
+            mergeFieldTokens.add(mergeMatcher.group());
+        }
+
+        return mergeFieldTokens;
+    }
+
+    //get object-field map from list of mergeFields
+    public static Map<String, Set<String>> getMergeFieldMap(Set<String> mergeFieldTokens) {
+
+        Map<String, Set<String>> mergeFieldMap = new Map<String, Set<String>>();
+        String objectName;
+        String fieldName;
+
+        if(mergeFieldTokens.isEmpty()) {
+            return null;
+        }
+        for(String mergeField : mergeFieldTokens) {
+            objectName = mergeField.substringBetween('{!','.');
+            fieldName = mergeField.substringBetween('.','}');
+
+            if(null == mergeFieldMap.get(objectName)) {
+                mergeFieldMap.put(objectName,new Set<String>());
+            }
+            mergeFieldMap.get(objectName).add(fieldName);
+        }
+
+        return mergeFieldMap;
+    }
+    
+
+
+    public static Map<String,String> getQueryStringForEachObject(Map<String, Set<String>> mergeFieldMap, Map<String, List<Id>> objectNameRecordIdMap) {
+        
+        Map<String,String> objectWiseQueryMap = new Map<String,String>(); 
+        String query;
+
+        for(String objectName : mergeFieldMap.keySet()) {
+            if(objectNameRecordIdMap.get(objectName)==null || objectNameRecordIdMap.get(objectName).isEmpty())
+                continue;
+            
+            query = '';
+            query += 'SELECT ';
+
+            for(String fieldName : mergeFieldMap.get(objectName)) {
+                query += fieldName + ',';
+            }
+            query = query.removeEnd(',');
+            query += ' FROM ' + objectName ;
+            
+            //add where clause
+            query += ' WHERE Id IN (\''+ String.join(objectNameRecordIdMap.get(objectName), '\',\'')  + '\')';
+            objectWiseQueryMap.put(objectName, query);
+            
+        }
+       
+        return objectWiseQueryMap;
+    }
+    
+    public static Map<String,Map<Id,SObject>> executeQuery(Map<String,String> objectWiseQuery) {
+        
+        Map<String,Map<Id,SObject>> result = new Map<String,Map<Id,SObject>>();
+        Integer queriesSoFarCount   = Limits.getQueries();
+        
+        Map<Id,SObject> resultMap;
+        
+        for(String objectName : objectWiseQuery.keySet()) {
+            
+             resultMap = new  Map<Id,SObject>(Database.query(objectWiseQuery.get(objectName)));
+             result.put(objectName,resultMap);
+            
+            ++queriesSoFarCount;
+            //avoid hitting governor limit
+            if( queriesSoFarCount == (Limits.getLimitQueries() - QUERY_LIMIT_CROSS_BUFFER) ) {
+                break;
+            }
+        }
+        
+        return result;
+    }
+    
+    //return primary object Id verses map
+    //public static Map<Id,String> populateBody(String primaryBody,){}
+    
+    //return primary object Id verses object body map
+    public static Map<Id, String> populateEmailTemplateBody( Map<Id, Map<String,Id> >  objectNameRecordIdMap
+                                                            , String emailTemplateName ) {
+        
+        Map<Id, String> recordIdEmailBodyMap = new Map<Id, String>();
+        Set<String> objectNameSet = new Set<String>();
+        List<Id> recordIdList = new List<Id>();
+       
+        EmailTemplate emailTemplate = getEmailTemplateByName(emailTemplateName);
+        Set<String> mergeFieldSet = getMergeFields(emailTemplate);
+
+        system.debug('mergeFieldSet= '+mergeFieldSet);
+
+        Map<String, Set<String>> objectWiseMergeFieldMap = getMergeFieldMap(mergeFieldSet);
+        
+        Map<String,List<Id>> objectWiseRecordIdBulkMap = new Map<String,List<Id>>(); 
+        for(String objectId : objectNameRecordIdMap.keySet()){
+            
+            if(objectNameRecordIdMap.get(objectId) == null || objectNameRecordIdMap.get(objectId).keySet().isEmpty() ) {
+                continue;
+            }
+            
+            for(String objectName : objectNameRecordIdMap.get(objectId).keySet()){
+                
+                if(objectWiseRecordIdBulkMap.get(objectName) == null ){
+                    objectWiseRecordIdBulkMap.put(objectName,new List<Id>());
+                }
+                
+                objectWiseRecordIdBulkMap.get(objectName).add(  objectNameRecordIdMap.get(objectId).get(objectName)   );
+            }
+        }
+
+        Map<String,String> objectWiseQueryMap = getQueryStringForEachObject(objectWiseMergeFieldMap,objectWiseRecordIdBulkMap);
+        Map<String,Map<Id,SObject>> objectWiseRecordsMap = executeQuery(objectWiseQueryMap);
+        
+        Map<Id,String> parentObjectWiseTemplateBody =  populateMergeFields(     objectNameRecordIdMap
+                                                                              , objectWiseRecordsMap
+                                                                              , objectWiseMergeFieldMap
+                                                                              , emailTemplate);
+        
+        return parentObjectWiseTemplateBody;
+    }
+    
+    public static  Map<Id,String> populateMergeFields(  Map<Id, Map<String,Id> >  objectNameRecordIdMap
+                                              , Map<String,Map<Id,SObject>> objectWiseRecordsMap
+                                              , Map<String, Set<String>> objectWiseMergeFieldMap
+                                              , EmailTemplate emailTemplate){
+                                            
+        Map<Id,String> parentObjectWiseTemplateBody = new Map<Id,String>();
+        
+        if(emailTemplate==null || String.isEmpty(emailTemplate.HtmlValue) )
+            return parentObjectWiseTemplateBody;
+                                 
+        Map<Id,SObject> objectIdWiseRecordMap;
+        Set<String> fieldSet;  
+        String recordId;
+        SObject record;
+        String emailBody = '';
+        Object value;
+        
+        for(Id parentObjectId : objectNameRecordIdMap.keySet()) {
+            
+            if(objectNameRecordIdMap.get(parentObjectId) == null)
+                continue;
+            
+            emailBody  = emailTemplate.HtmlValue;
+            
+            for(String objectName : objectNameRecordIdMap.get(parentObjectId).keySet()){
+                
+                if(objectNameRecordIdMap.get(parentObjectId).get(objectName) == null  || 
+                   objectWiseRecordsMap.get(objectName) == null)
+                    continue;
+                
+                
+                recordId = objectNameRecordIdMap.get(parentObjectId).get(objectName);
+                record   = objectWiseRecordsMap.get(objectName).get(recordId);
+                
+                fieldSet   = objectWiseMergeFieldMap.get(objectName);
+                
+                for(String fieldName : fieldSet){
+                    value = record.get(fieldName)==null ? '' : record.get(fieldName);
+                    emailBody = emailBody.replaceAll(wrapAsMergeField(objectName,fieldName),String.valueOf(value));
+                    
+                }
+                
+            }
+            
+            parentObjectWiseTemplateBody.put(parentObjectId,emailBody);
+        }
+        
+        return parentObjectWiseTemplateBody;                                         
+    }
+
+    public static String wrapAsMergeField(String objectName,String fieldName){
+        return '\\{!'+objectName+'.'+fieldName+'\\}';
+    }
+
+
+
+}
